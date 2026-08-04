@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: go-release-demo-cocogitto
+  description: >
+    Combo 3 reference implementation of immutable Go releases using
+    cocogitto + GoReleaser. Demonstrates atomic three-job release
+    execution (goreleaser → slsa → promote), cosign keyless signing,
+    SLSA L3 provenance, reproducible builds, and GitHub's
+    immutable-releases setting. Companion to bonial-oss/go-release-demo
+    (the meta / decision repo).
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+  links:
+    - title: GitHub project
+      url: https://github.com/bonial-oss/go-release-demo-cocogitto
+    - title: Meta / design docs
+      url: https://github.com/bonial-oss/go-release-demo
+    - title: Design spec — atomic release workflow
+      url: https://github.com/bonial-oss/go-release-demo/blob/main/docs/superpowers/specs/2026-07-23-immutable-releases-design.md
+  tags:
+    - go
+    - release-engineering
+    - reference-implementation
+    - immutable-releases
+    - combo-3
+    - cocogitto
+spec:
+  type: tool
+  lifecycle: experimental
+  owner: platform-engineering

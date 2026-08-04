@@ -1,0 +1,205 @@
+# SPDX-FileCopyrightText: 2026 Bonial International GmbH
+# SPDX-License-Identifier: Apache-2.0
+---
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'release' to confirm cutting a release from current main"
+        required: false
+        default: ""
+
+permissions: read-all
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_created: ${{ steps.decide.outputs.release_created }}
+      version:         ${{ steps.decide.outputs.version }}
+      tag_name:        ${{ steps.decide.outputs.tag_name }}
+      changelog_body:  ${{ steps.notes.outputs.body }}
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Install cocogitto
+        uses: cocogitto/cocogitto-action@v3
+        with:
+          check: false
+          release: false
+
+      - name: Decide whether to release
+        id: decide
+        shell: bash
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          NEXT=$(cog bump --auto --dry-run 2>/dev/null || true)
+          echo "cog bump --auto --dry-run => '${NEXT}'"
+          if [ -z "$NEXT" ]; then
+            echo "No release-worthy commits since last tag; nothing to release."
+            echo "release_created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM" != "release" ]; then
+            echo "::notice::Dry-run: would release ${NEXT}. Re-dispatch with confirm=release to cut it."
+            echo "release_created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "release_created=true" >> "$GITHUB_OUTPUT"
+          echo "version=${NEXT#v}"    >> "$GITHUB_OUTPUT"
+          echo "tag_name=${NEXT}"     >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes with cog changelog
+        if: steps.decide.outputs.release_created == 'true'
+        id: notes
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.decide.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          BODY=$(cog changelog --at "$TAG_NAME")
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  goreleaser:
+    needs: propose
+    if: needs.propose.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
+      tag_name: ${{ needs.propose.outputs.tag_name }}
+    steps:
+      - name: Preflight — tag must not already exist; delete stale draft release if present
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.propose.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Refusing to proceed." >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx true; then
+            echo "::warning::Stale draft release for ${TAG} exists — deleting so GoReleaser starts clean."
+            gh release delete "$TAG" --yes
+          fi
+
+      - name: Checkout at main (with full history for GoReleaser changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install syft (for SBOM generation)
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Write release notes to a file for GoReleaser
+        shell: bash
+        env:
+          CHANGELOG_BODY: ${{ needs.propose.outputs.changelog_body }}
+        run: |
+          printf '%s' "$CHANGELOG_BODY" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create and push the release tag (GoReleaser expects the tag to exist at HEAD)
+        shell: bash
+        env:
+          TAG: ${{ needs.propose.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: GoReleaser (build, sign, SBOM, draft release)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean --release-notes=${{ runner.temp }}/release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ needs.propose.outputs.tag_name }}
+
+      - name: Emit hashes for SLSA
+        id: hashes
+        shell: bash
+        run: |
+          echo "hashes=$(base64 -w0 < dist/checksums.txt)" >> "$GITHUB_OUTPUT"
+
+  slsa:
+    needs: goreleaser
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.goreleaser.outputs.hashes }}"
+      upload-assets: true
+      upload-tag-name: ${{ needs.goreleaser.outputs.tag_name }}
+      draft-release: true
+
+  promote:
+    needs: [goreleaser, slsa]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Publish the draft release (last write; immutable-safe)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.goreleaser.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --repo "$REPO"
+          echo "Published $TAG"
+
+      - name: On failure — open a follow-up issue
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.goreleaser.outputs.tag_name }}
+        run: |
+          gh issue create \
+            --repo "$REPO" \
+            --title "Release ${TAG}: promote job failed" \
+            --body "The promote job failed after goreleaser + slsa succeeded. The draft release at ${TAG} needs manual review."
