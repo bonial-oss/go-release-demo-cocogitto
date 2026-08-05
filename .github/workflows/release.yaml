@@ -74,7 +74,18 @@ jobs:
           TAG_NAME: ${{ steps.decide.outputs.tag_name }}
         run: |
           set -euo pipefail
-          BODY=$(cog changelog --at "$TAG_NAME")
+          # cog changelog --at <tag> requires the tag to already exist,
+          # but at this point in the pipeline the tag has not been created
+          # yet (goreleaser creates it later). Instead, generate the
+          # changelog for the range between the previous tag (if any) and
+          # HEAD. For the first release, run cog changelog without a range
+          # and let it pick up everything since the root commit.
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            BODY=$(cog changelog "$LAST_TAG..HEAD")
+          else
+            BODY=$(cog changelog)
+          fi
           {
             echo "body<<CHANGELOG_EOF"
             echo "$BODY"
